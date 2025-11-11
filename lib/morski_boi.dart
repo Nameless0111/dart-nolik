@@ -1,5 +1,8 @@
 import 'dart:io';
 import 'dart:math';
+import 'dart:async';
+import 'dart:isolate';
+import 'dart:convert';
 
 // Модель корабля
 class Ship {
@@ -30,6 +33,165 @@ class Ship {
   }
 }
 
+// Событие игры для логирования
+class GameEvent {
+  final String playerName;
+  final String type; // move, place, error
+  final String message;
+  final DateTime timestamp;
+  GameEvent({
+    required this.playerName,
+    required this.type,
+    required this.message,
+    DateTime? timestamp,
+  }) : timestamp = timestamp ?? DateTime.now();
+}
+
+// Логгер игры (Stream -> файл)
+class GameLogger {
+  final String logPath;
+  IOSink? _sink;
+  StreamSubscription<GameEvent>? _subscription;
+  GameLogger({required this.logPath});
+
+  Future<void> start(Stream<GameEvent> events) async {
+    final file = await _ensureFile(logPath);
+    _sink = file.openWrite(mode: FileMode.append);
+    _subscription = events.listen((e) {
+      _sink?.writeln('[${e.timestamp.toIso8601String()}] [${e.type}] ${e.playerName}: ${e.message}');
+    });
+  }
+
+  Future<void> logError(String who, String message) async {
+    final file = await _ensureFile(logPath);
+    final sink = file.openWrite(mode: FileMode.append);
+    sink.writeln('[${DateTime.now().toIso8601String()}] [error] $who: $message');
+    await sink.flush();
+    await sink.close();
+  }
+
+  Future<void> stop() async {
+    await _subscription?.cancel();
+    await _sink?.flush();
+    await _sink?.close();
+  }
+
+  Future<File> _ensureFile(String path) async {
+    final file = File(path);
+    await file.parent.create(recursive: true);
+    if (!await file.exists()) {
+      await file.create(recursive: true);
+    }
+    return file;
+  }
+}
+
+// Статистика игрока (файл per player)
+class PlayerStatsManager {
+  final String dirPath;
+  PlayerStatsManager({required this.dirPath});
+
+  Future<Map<String, dynamic>> load(String playerName) async {
+    final file = await _ensureFile('$dirPath/${_safe(playerName)}.json');
+    if (await file.length() == 0) {
+      final data = {'name': playerName, 'gamesPlayed': 0, 'wins': 0, 'losses': 0};
+      await file.writeAsString(jsonEncode(data));
+      return data;
+    }
+    final content = await file.readAsString();
+    return jsonDecode(content) as Map<String, dynamic>;
+  }
+
+  Future<void> update(String playerName, {int? gamesPlayed, int? wins, int? losses}) async {
+    final file = await _ensureFile('$dirPath/${_safe(playerName)}.json');
+    Map<String, dynamic> data = {};
+    if (await file.length() > 0) {
+      data = jsonDecode(await file.readAsString()) as Map<String, dynamic>;
+    } else {
+      data = {'name': playerName, 'gamesPlayed': 0, 'wins': 0, 'losses': 0};
+    }
+    if (gamesPlayed != null) data['gamesPlayed'] = gamesPlayed;
+    if (wins != null) data['wins'] = wins;
+    if (losses != null) data['losses'] = losses;
+    await file.writeAsString(jsonEncode(data));
+  }
+
+  String _safe(String s) => s.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_');
+
+  Future<File> _ensureFile(String path) async {
+    final file = File(path);
+    await file.parent.create(recursive: true);
+    if (!await file.exists()) {
+      await file.create(recursive: true);
+    }
+    return file;
+  }
+}
+
+// Текущая игра: попадания/промахи/состояние кораблей, файл очищается/удаляется после игры
+class CurrentGameTracker {
+  final String filePath;
+  Map<String, dynamic> state = {};
+  CurrentGameTracker({required this.filePath});
+
+  Future<void> init(List<String> playerNames) async {
+    await _ensureFile(filePath);
+    state = {
+      'players': {
+        for (final name in playerNames)
+          name: {
+            'hits': 0,
+            'misses': 0,
+            'ships': {'alive': 0, 'damaged': 0, 'destroyed': 0}
+          }
+      }
+    };
+    await _persist();
+  }
+
+  Future<void> updateShot(String playerName, String result) async {
+    final p = (state['players'] as Map<String, dynamic>)[playerName] as Map<String, dynamic>;
+    if (result == 'hit' || result == 'destroyed') {
+      p['hits'] = (p['hits'] as int) + 1;
+    } else if (result == 'miss' || result == 'already_shot' || result == 'out_of_bounds') {
+      p['misses'] = (p['misses'] as int) + 1;
+    }
+    await _persist();
+  }
+
+  Future<void> updateShips(String ownerName, List<Ship> ships, List<Position> shots) async {
+    final p = (state['players'] as Map<String, dynamic>)[ownerName] as Map<String, dynamic>;
+    int destroyed = ships.where((s) => s.isDestroyed).length;
+    int damaged = ships.where((s) => !s.isDestroyed && s.positions.any((pos) => shots.any((h) => h == pos))).length;
+    int alive = ships.length - destroyed - damaged;
+    p['ships'] = {'alive': alive, 'damaged': damaged, 'destroyed': destroyed};
+    await _persist();
+  }
+
+  Future<void> clearOrDelete({bool delete = true}) async {
+    final file = File(filePath);
+    if (!await file.exists()) return;
+    if (delete) {
+      await file.delete();
+    } else {
+      await file.writeAsString('');
+    }
+  }
+
+  Future<void> _persist() async {
+    final file = await _ensureFile(filePath);
+    await file.writeAsString(jsonEncode(state));
+  }
+
+  Future<File> _ensureFile(String path) async {
+    final file = File(path);
+    await file.parent.create(recursive: true);
+    if (!await file.exists()) {
+      await file.create(recursive: true);
+    }
+    return file;
+  }
+}
 // Позиция на поле
 class Position {
   final int x;
@@ -278,9 +440,9 @@ class Player {
   }
 
   // Выстрел игрока (нельзя стрелять в уже обстрелянные клетки)
-  Position? makeMove(List<Position> forbiddenShots) {
+  Future<Position?> makeMove(List<Position> forbiddenShots) async {
     if (isBot) {
-      return _makeBotMove(forbiddenShots);
+      return await _makeBotMove(forbiddenShots);
     }
 
     print('\n=== ХОД ИГРОКА $name ===');
@@ -292,26 +454,41 @@ class Player {
         print('Вы уже стреляли в эту клетку. Выберите другую.');
         continue;
       }
-      return pos;
+      return Future.value(pos);
     }
   }
 
-  // Выстрел бота (только по новым клеткам и не рядом с уничтоженными кораблями)
-  Position? _makeBotMove(List<Position> forbiddenShots) {
-    Random random = Random();
-    // Теоретически максимум size*size попыток достаточно
-    for (int attempts = 0; attempts < board.size * board.size; attempts++) {
-      int x = random.nextInt(board.size);
-      int y = random.nextInt(board.size);
-      final pos = Position(x, y);
-      final alreadyShot = forbiddenShots.any((p) => p == pos);
-      if (alreadyShot) continue;
-      
-      return pos;
-    }
-    return null; // На всякий случай, если всё поле уже обстреляно
+  // Выстрел бота с использованием изолята
+  Future<Position?> _makeBotMove(List<Position> forbiddenShots) async {
+    final receivePort = ReceivePort();
+    await Isolate.spawn<_BotMovePayload>(
+      _botMoveIsolate,
+      _BotMovePayload(
+        sendPort: receivePort.sendPort,
+        size: board.size,
+        forbidden: forbiddenShots.map((p) => [p.x, p.y]).toList(),
+      ),
+    );
+    final result = await receivePort.first as List<int>?;
+    if (result == null) return null;
+    return Position(result[0], result[1]);
   }
 
+  static void _botMoveIsolate(_BotMovePayload payload) {
+    final random = Random();
+    final size = payload.size;
+    final forbidden = payload.forbidden.map((e) => '${e[0]}:${e[1]}').toSet();
+    for (int attempts = 0; attempts < size * size; attempts++) {
+      final x = random.nextInt(size);
+      final y = random.nextInt(size);
+      final key = '$x:$y';
+      if (!forbidden.contains(key)) {
+        payload.sendPort.send([x, y]);
+        return;
+      }
+    }
+    payload.sendPort.send(null);
+  }
   // Ввод позиции
   Position? _getPositionInput(String prompt) {
     while (true) {
@@ -373,20 +550,37 @@ class Player {
   }
 }
 
+class _BotMovePayload {
+  final SendPort sendPort;
+  final int size;
+  final List<List<int>> forbidden;
+  _BotMovePayload({required this.sendPort, required this.size, required this.forbidden});
+}
+
 // Игра
 class Game {
   late Player player1;
   late Player player2;
   late int boardSize;
   bool isPlayer1Turn = true;
+  final _events = StreamController<GameEvent>.broadcast();
+  late final GameLogger _logger;
+  late final PlayerStatsManager _stats;
+  late final CurrentGameTracker _currentGame;
 
-  void start() {
+  Future<void> start() async {
     print('=== МОРСКОЙ БОЙ ===');
+    _logger = GameLogger(logPath: 'logs/game.log');
+    _stats = PlayerStatsManager(dirPath: 'data/players');
+    _currentGame = CurrentGameTracker(filePath: 'data/current_game.json');
+    await _logger.start(_events.stream);
     _selectGameMode();
     _selectBoardSize();
     _createPlayers();
-    _placeShips();
-    _playGame();
+    await _currentGame.init([player1.name, player2.name]);
+    await _placeShips();
+    await _playGame();
+    await _logger.stop();
   }
 
   void _selectGameMode() {
@@ -475,14 +669,25 @@ class Game {
     }
   }
 
-  void _placeShips() {
+  Future<void> _placeShips() async {
     player1.placeShips();
     _clearConsole();
     player2.placeShips();
     _clearConsole();
+    await _currentGame.updateShips(player1.name, player1.board.ships, player2.board.shots);
+    await _currentGame.updateShips(player2.name, player2.board.ships, player1.board.shots);
   }
 
-  void _playGame() {
+  Future<void> _playGame() async {
+    // увеличить счётчик сыгранных игр
+    try {
+      final s1 = await _stats.load(player1.name);
+      await _stats.update(player1.name, gamesPlayed: (s1['gamesPlayed'] as int) + 1, wins: s1['wins'] as int, losses: s1['losses'] as int);
+      final s2 = await _stats.load(player2.name);
+      await _stats.update(player2.name, gamesPlayed: (s2['gamesPlayed'] as int) + 1, wins: s2['wins'] as int, losses: s2['losses'] as int);
+    } catch (e) {
+      await _logger.logError('system', 'Ошибка обновления статистики игроков: $e');
+    }
     while (!player1.board.allShipsDestroyed() && !player2.board.allShipsDestroyed()) {
       Player currentPlayer = isPlayer1Turn ? player1 : player2;
       Player opponent = isPlayer1Turn ? player2 : player1;
@@ -519,10 +724,16 @@ class Game {
         }
       }
       
-      Position? shot = currentPlayer.makeMove(forbiddenShots);
+      Position? shot = await currentPlayer.makeMove(forbiddenShots);
       if (shot == null) continue;
       
       String result = opponent.board.shoot(shot);
+      // лог/стрим событие
+      final col = String.fromCharCode(65 + shot.y);
+      final row = shot.x + 1;
+      _events.add(GameEvent(playerName: currentPlayer.name, type: 'move', message: 'Ход на $row$col → $result'));
+      await _currentGame.updateShot(currentPlayer.name, result);
+      await _currentGame.updateShips(opponent.name, opponent.board.ships, opponent.board.shots);
       
       if (!currentPlayer.isBot) {
         print('\nРезультат выстрела:');
@@ -538,9 +749,11 @@ class Game {
             break;
           case 'already_shot':
             print('Вы уже стреляли в эту клетку!');
+            await _logger.logError(currentPlayer.name, 'Ошибка, вы уже ходили на $row$col');
             break;
           case 'out_of_bounds':
             print('Выстрел за пределы поля!');
+            await _logger.logError(currentPlayer.name, 'Ошибка, ход за пределы поля $row$col');
             break;
         }
         
@@ -570,6 +783,26 @@ class Game {
     player1.board.displayBoard();
     print('\nПоле ${player2.name}:');
     player2.board.displayBoard();
+    () async {
+      try {
+        final s1 = await _stats.load(player1.name);
+        final s2 = await _stats.load(player2.name);
+        if (winner.name == player1.name) {
+          await _stats.update(player1.name, gamesPlayed: s1['gamesPlayed'] as int, wins: (s1['wins'] as int) + 1, losses: s1['losses'] as int);
+          await _stats.update(player2.name, gamesPlayed: s2['gamesPlayed'] as int, wins: s2['wins'] as int, losses: (s2['losses'] as int) + 1);
+        } else {
+          await _stats.update(player2.name, gamesPlayed: s2['gamesPlayed'] as int, wins: (s2['wins'] as int) + 1, losses: s2['losses'] as int);
+          await _stats.update(player1.name, gamesPlayed: s1['gamesPlayed'] as int, wins: s1['wins'] as int, losses: (s1['losses'] as int) + 1);
+        }
+      } catch (e) {
+        await _logger.logError('system', 'Ошибка обновления побед/поражений: $e');
+      }
+      try {
+        await _currentGame.clearOrDelete(delete: true);
+      } catch (e) {
+        await _logger.logError('system', 'Ошибка очистки current_game.json: $e');
+      }
+    }();
   }
 
   void _clearConsole() {
@@ -579,7 +812,7 @@ class Game {
   String _gameMode = '';
 }
 
-void main() {
+Future<void> main() async {
   Game game = Game();
-  game.start();
+  await game.start();
 }
